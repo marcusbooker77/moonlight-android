@@ -17,6 +17,9 @@ import com.limelight.binding.video.CrashListener;
 import com.limelight.binding.video.MediaCodecDecoderRenderer;
 import com.limelight.binding.video.MediaCodecHelper;
 import com.limelight.binding.video.PerfOverlayListener;
+import com.limelight.overlay.ReconnectOverlay;
+import com.limelight.overlay.StatsOverlay;
+import com.limelight.wifi.WifiMonitor;
 import com.limelight.nvstream.NvConnection;
 import com.limelight.nvstream.NvConnectionListener;
 import com.limelight.nvstream.StreamConfiguration;
@@ -55,6 +58,8 @@ import android.graphics.Rect;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
+import android.net.NetworkInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -148,6 +153,16 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private TextView performanceOverlayView;
 
     private MediaCodecDecoderRenderer decoderRenderer;
+
+    private StatsOverlay statsOverlay;
+    private ReconnectOverlay reconnectOverlay;
+    private WifiMonitor wifiMonitor;
+    private boolean smartReconnectEnabled = true;
+    private static final int SMART_RECONNECT_MAX_ATTEMPTS = 6;
+
+    // Stats overlay controller toggle: Select+L1 held for 2 seconds
+    private long selectL1DownTime;
+    private boolean selectL1Pending;
     private boolean reportedCrash;
 
     private WifiManager.WifiLock highPerfWifiLock;
@@ -271,6 +286,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         notificationOverlayView = findViewById(R.id.notificationOverlay);
 
         performanceOverlayView = findViewById(R.id.performanceOverlay);
+
+        statsOverlay = findViewById(R.id.statsOverlay);
+        reconnectOverlay = findViewById(R.id.reconnectOverlay);
+        wifiMonitor = new WifiMonitor();
 
         inputCaptureProvider = InputCaptureManager.getInputCaptureProvider(this, this);
 
@@ -597,6 +616,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
                 performanceOverlayView.setVisibility(View.GONE);
                 notificationOverlayView.setVisibility(View.GONE);
+                if (statsOverlay != null) {
+                    statsOverlay.setVisibility(View.GONE);
+                }
 
                 // Disable sensors while in PiP mode
                 controllerHandler.disableSensors();
@@ -618,6 +640,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 }
 
                 notificationOverlayView.setVisibility(requestedNotificationOverlayVisibility);
+
+                if (statsOverlay != null) {
+                    statsOverlay.setVisibility(View.VISIBLE);
+                }
 
                 // Enable sensors again after exiting PiP
                 controllerHandler.enableSensors();
@@ -1485,6 +1511,19 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         inputManager.toggleSoftInput(0, 0);
     }
 
+    @Override
+    public void toggleStatsOverlay() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (statsOverlay != null) {
+                    statsOverlay.toggle();
+                    LimeLog.info("Stats overlay toggled to: " + statsOverlay.getMode());
+                }
+            }
+        });
+    }
+
     private byte getLiTouchTypeFromEvent(MotionEvent event) {
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
@@ -2206,12 +2245,42 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     public void stageComplete(String stage) {
     }
 
+    /**
+     * Check if network connectivity is currently available for reconnection.
+     */
+    private boolean isNetworkAvailable() {
+        try {
+            ConnectivityManager connMgr = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (connMgr == null) return false;
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                android.net.Network network = connMgr.getActiveNetwork();
+                if (network == null) return false;
+                NetworkCapabilities caps = connMgr.getNetworkCapabilities(network);
+                return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            } else {
+                NetworkInfo info = connMgr.getActiveNetworkInfo();
+                return info != null && info.isConnected();
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void stopConnection() {
         if (connecting || connected) {
             connecting = connected = false;
             updatePipAutoEnter();
 
             controllerHandler.stop();
+
+            // Stop WiFi monitoring
+            if (wifiMonitor != null) {
+                wifiMonitor.stop();
+            }
+
+            // Remove server stats listener
+            MoonBridge.setServerStatsListener(null);
 
             // Update GameManager state to indicate we're no longer in game
             UiHelper.notifyStreamEnded(this);
@@ -2271,10 +2340,112 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
     @Override
     public void connectionTerminated(final int errorCode) {
+        // For graceful termination or non-reconnectable errors, skip smart reconnect
+        if (errorCode == MoonBridge.ML_ERROR_GRACEFUL_TERMINATION ||
+                errorCode == MoonBridge.ML_ERROR_PROTECTED_CONTENT ||
+                !smartReconnectEnabled) {
+            handleConnectionTerminatedFinal(errorCode);
+            return;
+        }
+
+        // Attempt smart reconnect: freeze frame is automatic (we don't clear the surface)
+        LimeLog.info("Connection lost (error " + errorCode + "), attempting smart reconnect...");
+
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (reconnectOverlay != null) {
+                    reconnectOverlay.show(SMART_RECONNECT_MAX_ATTEMPTS);
+                }
+            }
+        });
+
+        // Run reconnect attempts on a background thread
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                boolean reconnected = false;
+
+                for (int attempt = 1; attempt <= SMART_RECONNECT_MAX_ATTEMPTS; attempt++) {
+                    final int currentAttempt = attempt;
+                    LimeLog.info("Reconnect attempt " + attempt + "/" + SMART_RECONNECT_MAX_ATTEMPTS);
+
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (reconnectOverlay != null) {
+                                reconnectOverlay.setAttempt(currentAttempt);
+                            }
+                        }
+                    });
+
+                    // Exponential backoff: 500ms, 1000ms, 1500ms, 2000ms, 2500ms, 3000ms
+                    try {
+                        Thread.sleep(500L * attempt);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+
+                    // Check if WiFi/network is available
+                    if (!isNetworkAvailable()) {
+                        LimeLog.info("No network available, skipping attempt " + attempt);
+                        continue;
+                    }
+
+                    // Attempt to reconnect by stopping and restarting the connection
+                    try {
+                        synchronized (MoonBridge.class) {
+                            MoonBridge.stopConnection();
+                            MoonBridge.cleanupBridge();
+                        }
+
+                        // Re-start the connection with the same parameters
+                        if (conn != null && surfaceCreated && streamView.getHolder().getSurface().isValid()) {
+                            decoderRenderer.setRenderTarget(streamView.getHolder());
+                            conn.start(new AndroidAudioRenderer(Game.this, prefConfig.enableAudioFx),
+                                    decoderRenderer, Game.this);
+
+                            // Wait briefly to see if connection succeeds
+                            Thread.sleep(2000);
+
+                            if (connected) {
+                                reconnected = true;
+                                LimeLog.info("Reconnect succeeded on attempt " + attempt);
+                                break;
+                            }
+                        }
+                    } catch (Exception e) {
+                        LimeLog.warning("Reconnect attempt " + attempt + " failed: " + e.getMessage());
+                    }
+                }
+
+                final boolean success = reconnected;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (reconnectOverlay != null) {
+                            reconnectOverlay.hide();
+                        }
+
+                        if (!success) {
+                            // All attempts failed, fall through to normal disconnect handling
+                            handleConnectionTerminatedFinal(errorCode);
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * Original connection terminated handler, called when smart reconnect is disabled
+     * or after all reconnect attempts have failed.
+     */
+    private void handleConnectionTerminatedFinal(final int errorCode) {
         // Perform a connection test if the failure could be due to a blocked port
         // This does network I/O, so don't do it on the main thread.
         final int portFlags = MoonBridge.getPortFlagsFromTerminationErrorCode(errorCode);
-        final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER,443, portFlags);
+        final int portTestResult = MoonBridge.testClientConnectivity(ServerHelper.CONNECTION_TEST_SERVER, 443, portFlags);
 
         runOnUiThread(new Runnable() {
             @Override
@@ -2414,6 +2585,38 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
                 // Update GameManager state to indicate we're in game
                 UiHelper.notifyStreamConnected(Game.this);
+
+                // Register server stats listener for control channel messages (type 0x3004)
+                MoonBridge.setServerStatsListener(new MoonBridge.ServerStatsListener() {
+                    @Override
+                    public void onServerStats(final int bitrate, final int fecPct, final int thermalState) {
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (statsOverlay != null) {
+                                    statsOverlay.updateServerStats(bitrate, fecPct, thermalState);
+                                }
+                            }
+                        });
+                    }
+                });
+
+                // Start WiFi quality monitoring
+                wifiMonitor.start(Game.this, new WifiMonitor.WifiCallback() {
+                    @Override
+                    public void onWifiQualityChanged(int quality, int rssi, int linkSpeed) {
+                        // Update the stats overlay
+                        if (statsOverlay != null) {
+                            statsOverlay.updateWifiStats(quality, rssi, linkSpeed);
+                        }
+
+                        // Send WiFi quality to server via control channel (type 0x3003)
+                        if (conn != null) {
+                            byte[] payload = WifiMonitor.buildWifiQualityPayload(quality, rssi, linkSpeed);
+                            MoonBridge.sendWifiQuality(payload);
+                        }
+                    }
+                });
 
                 hideSystemUi(1000);
             }
@@ -2642,6 +2845,19 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             @Override
             public void run() {
                 performanceOverlayView.setText(text);
+            }
+        });
+    }
+
+    @Override
+    public void onPerfStatsUpdate(final float decodeTimeMs, final float renderTimeMs,
+                                  final float networkLatencyMs, final int fps, final String codec) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (statsOverlay != null) {
+                    statsOverlay.updateClientStats(decodeTimeMs, renderTimeMs, networkLatencyMs, fps, codec);
+                }
             }
         });
     }
